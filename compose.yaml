@@ -1,0 +1,15 @@
+services:
+  cachecore:
+    build: .
+    image: cachecore:1.0.0
+    ports:
+      - "${CACHECORE_PORT:-8080}:8080"
+    environment:
+      CACHECORE_MAX_ENTRIES: "${CACHECORE_MAX_ENTRIES:-10000}"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
