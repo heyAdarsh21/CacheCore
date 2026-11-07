@@ -1,156 +1,177 @@
-# CacheCore v1.0
+# CacheCore
 
-CacheCore is a single-node, in-memory cache exposed through an HTTP/JSON API. It
-supports string keys and values, optional per-entry TTLs, LRU capacity eviction,
-and cumulative hit/miss/eviction/expiration statistics.
+**A small cache server. A closer look at what happens inside one.**
 
-> **Not production-ready.** Storage is volatile: every entry is lost when the
-> process stops. This release is intentionally single-node and has no
-> replication, persistence, authentication, or distributed coordination.
+CacheCore is a single-node, in-memory caching service built with Java 21 and Spring Boot. It exposes a REST API for storing, retrieving and deleting key-value entries, with TTL-based expiration, LRU eviction and runtime statistics.
 
-## Contents
+The idea was to build a cache that is simple enough to understand, but substantial enough to explore the engineering decisions behind one: expiration, eviction, concurrency, capacity management and performance.
 
-- [Features](#features)
-- [Architecture](#architecture)
-- [Prerequisites](#prerequisites)
-- [Build and test](#build-and-test)
-- [Run](#run)
-- [Configuration](#configuration)
-- [HTTP API](#http-api)
-- [Semantics and validation](#semantics-and-validation)
-- [Docker](#docker)
-- [Benchmark](#benchmark)
-- [Design decisions and limitations](#design-decisions-and-limitations)
-- [Project layout](#project-layout)
+This is not an attempt to recreate Redis. It is an implementation of a focused caching system, with its internal behaviour kept explicit.
 
-## Features
+---
 
-- `SET`/replace, `GET`, and `DELETE` for string values.
-- Optional TTL in milliseconds using a monotonic clock.
-- Positive maximum entry count with least-recently-used (LRU) eviction.
-- Lazy expiration on access; no background scheduler.
-- Hits, misses, evictions, expirations, current size, maximum size, and hit ratio.
-- Thread-safe cache engine with explicit capacity enforcement.
-- REST API with consistent status codes and RFC 9457 problem-detail errors.
-- Actuator health endpoint at `/actuator/health`.
-- Multi-stage Dockerfile and minimal Docker Compose configuration.
-- Unit, HTTP, validation, and concurrency tests.
+## What it does
 
-## Architecture
+- **Store and retrieve:** Put, get and delete string key-value entries through an HTTP API.
+- **Time-to-live:** Give individual entries an optional lifetime, expressed in milliseconds.
+- **LRU eviction:** When capacity is reached, remove the least recently used entry to make room for a new one.
+- **Lazy expiration:** Expired entries are removed when encountered; no background cleanup thread is required.
+- **Thread safety:** Protect cache operations and internal state using a single synchronization mechanism.
+- **Runtime statistics:** Track hits, misses, evictions, expirations, current size and hit ratio.
+- **Consistent errors:** Return structured HTTP errors using RFC 9457 Problem Details.
+- **Containerized deployment:** Build and run the service using Docker and Docker Compose.
 
+## A look inside
+
+The cache engine is deliberately independent of Spring Boot. It owns the actual storage and cache behaviour; the web layer is responsible for exposing that behaviour over HTTP.
+
+```text
+                  Client
+                    |
+                    | HTTP / JSON
+                    v
+          +----------------------+
+          |    REST API Layer    |
+          |                      |
+          | CacheController      |
+          | Request validation   |
+          | Exception handling   |
+          +----------------------+
+                    |
+                    v
+          +----------------------+
+          |     Cache Engine     |
+          |                      |
+          | LinkedHashMap        |
+          | TTL management       |
+          | LRU eviction         |
+          | Capacity enforcement |
+          | Statistics           |
+          +----------------------+
+                    ^
+                    |
+          +----------------------+
+          |   Configuration      |
+          |                      |
+          | CacheProperties      |
+          | CacheConfiguration   |
+          +----------------------+
 ```
-HTTP request
-    |
-    v
-web/            CacheController, request/response records, size filter, error handler
-    |
-    v
-engine/         CacheEngine, entry model, stats, validation limits (no Spring dependency)
-    ^
-    |
-config/         CacheProperties, engine bean, startup logging
-```
 
-- **`engine/CacheEngine`** owns the store, expiration, eviction, and counters. It
-  is a plain Java class and is unit-tested without starting Spring.
-- **`config/`** binds `cachecore.max-entries` and creates the singleton engine.
-- **`web/`** maps HTTP routes, validates request shape through the engine rules,
-  returns JSON, and translates errors into problem details.
+### The decisions behind the engine
 
-### Concurrency strategy
+**Storage and eviction**
 
-All store and counter mutations run under a single private monitor. A capacity
-check, expiration purge, LRU eviction, and insertion therefore happen atomically.
-A `LinkedHashMap` in access-order mode stores entries; a successful `GET` or a
-replacement moves the key to the most-recently-used position. This is deliberately
-simple and correct for one node. The global lock is a throughput ceiling under
-heavy contention, not a correctness compromise.
+The engine uses an access-order `LinkedHashMap`. This provides a straightforward way to maintain LRU ordering without introducing a separate recency data structure.
 
-## Prerequisites
+A successful read or replacement updates an entry's recency. When a new entry arrives and the cache is full, the least recently used live entry is evicted.
 
-- **JDK 21** (`java -version` must report 21).
-- No system Maven installation is required: the Maven wrapper is included and
-  downloads Maven 3.9.9 on first use.
-- Docker and Docker Compose are optional.
+**Expiration**
 
-On Windows, use `.\mvnw.cmd`; on Linux/macOS use `./mvnw`.
+TTL is measured using `System.nanoTime()` rather than wall-clock time. A monotonic clock avoids expiration calculations being affected by system clock adjustments.
 
-## Build and test
+Expiration is lazy. An expired entry is removed when an operation encounters it or when a capacity/statistics operation performs cleanup. There is no scheduled background task.
+
+**Concurrency**
+
+All store and counter operations are guarded by a single private monitor.
+
+This makes operations such as checking capacity, removing expired entries, selecting an LRU victim and inserting a new entry atomic with respect to other cache operations.
+
+It is a deliberately straightforward design. The trade-off is contention: a single global lock can limit throughput under heavy concurrent workloads. That limitation is part of the design, not something hidden behind a claim of unlimited scalability.
+
+---
+
+## Getting started
+
+### Requirements
+
+- Java 21
+- Maven 3.9.9 (not required as a separate installation; the Maven Wrapper is included)
+- Docker Desktop and Docker Compose, if running the containerized version
+
+### Build and test
+
+Clone the repository:
 
 ```bash
-./mvnw clean verify
+git clone https://github.com/heyAdarsh21/CacheCore.git
+cd CacheCore
 ```
 
-Windows PowerShell:
+Run the complete test suite:
+
+**Windows PowerShell**
 
 ```powershell
 .\mvnw.cmd clean verify
 ```
 
-This runs the complete JUnit 5 suite and builds the executable Spring Boot jar at
-`target/cachecore-1.0.0.jar`.
+**Linux / macOS**
 
-## Run
+```bash
+./mvnw clean verify
+```
+
+The executable JAR is generated at:
+
+```text
+target/cachecore-1.0.0.jar
+```
+
+### Run locally
 
 ```bash
 java -jar target/cachecore-1.0.0.jar
 ```
 
-Or during development:
+By default, the application listens on:
 
-```bash
-./mvnw spring-boot:run
+```text
+http://localhost:8080
 ```
 
-The service listens on `http://localhost:8080` by default. Check health:
+Check that it is running:
 
 ```bash
 curl http://localhost:8080/actuator/health
 ```
 
-## Configuration
+Expected response:
 
-| Property / environment variable | Default | Description |
-|---|---:|---|
-| `server.port` / `SERVER_PORT` | `8080` | HTTP port |
-| `cachecore.max-entries` / `CACHECORE_MAX_ENTRIES` | `10000` | Positive maximum live entry count |
-
-Examples:
-
-```bash
-SERVER_PORT=9090 CACHECORE_MAX_ENTRIES=500 java -jar target/cachecore-1.0.0.jar
+```json
+{
+  "status": "UP"
+}
 ```
 
-```powershell
-$env:SERVER_PORT = "9090"; $env:CACHECORE_MAX_ENTRIES = "500"; java -jar target/cachecore-1.0.0.jar
+---
+
+## Working with the API
+
+All cache operations use the base path:
+
+```text
+/api/v1/cache
 ```
 
-An invalid non-positive `max-entries` value fails application startup rather than
-silently running with an invalid cache.
+| Method | Endpoint | Behaviour |
+|---|---|---|
+| PUT | `/{key}` | Create or replace an entry |
+| GET | `/{key}` | Retrieve an entry |
+| DELETE | `/{key}` | Remove an entry |
+| GET | `/stats` | Retrieve cache statistics |
+| GET | `/actuator/health` | Check application health |
 
-## HTTP API
-
-Base path: `/api/v1/cache`.
-
-| Method | Path | Success | Meaning |
-|---|---|---|---|
-| `PUT` | `/{key}` | `201 Created` for a new live key, `200 OK` for a replacement | Store or replace a value with optional TTL |
-| `GET` | `/{key}` | `200 OK` | Return a live value |
-| `GET` | `/{key}` (miss) | `404 Not Found` | Cache miss, body code `CACHE_MISS` |
-| `DELETE` | `/{key}` | `204 No Content` | Remove a live entry |
-| `DELETE` | `/{key}` (miss) | `404 Not Found` | No live entry, body code `CACHE_MISS` |
-| `GET` | `/stats` | `200 OK` | Cache statistics snapshot |
-| `GET` | `/actuator/health` | `200 OK` | Lightweight health check |
-
-### Put
+### 1. Put an entry
 
 ```bash
 curl -i -X PUT http://localhost:8080/api/v1/cache/greeting \
-  -H 'Content-Type: application/json' \
+  -H "Content-Type: application/json" \
   -d '{"value":"hello","ttlMillis":60000}'
 ```
 
-`201 Created` (a replacement returns `200 OK`):
+Response:
 
 ```json
 {
@@ -161,14 +182,17 @@ curl -i -X PUT http://localhost:8080/api/v1/cache/greeting \
 }
 ```
 
-Omit `ttlMillis` (or send `null`) for an entry that never expires. Replacing an
-entry replaces its TTL too, so replacing with no TTL clears the old expiration.
+A new entry returns `201 Created`. Replacing an existing live entry returns `200 OK`.
 
-### Get
+The `ttlMillis` field is optional. Omit it or send `null` to create an entry without expiration.
+
+### 2. Get an entry
 
 ```bash
 curl -i http://localhost:8080/api/v1/cache/greeting
 ```
+
+Response:
 
 ```json
 {
@@ -177,32 +201,23 @@ curl -i http://localhost:8080/api/v1/cache/greeting
 }
 ```
 
-Miss:
+If the key does not exist or has expired, the API returns `404 Not Found`.
 
-```json
-{
-  "type": "about:blank",
-  "title": "Not Found",
-  "status": 404,
-  "detail": "No cache entry exists for key 'greeting'",
-  "instance": "/api/v1/cache/greeting",
-  "code": "CACHE_MISS"
-}
-```
-
-### Delete
+### 3. Delete an entry
 
 ```bash
 curl -i -X DELETE http://localhost:8080/api/v1/cache/greeting
 ```
 
-`204 No Content` when a live entry was removed; `404` with `CACHE_MISS` otherwise.
+A successful deletion returns `204 No Content`. A missing entry returns `404 Not Found`.
 
-### Statistics
+### 4. Inspect cache statistics
 
 ```bash
 curl http://localhost:8080/api/v1/cache/stats
 ```
+
+Example response:
 
 ```json
 {
@@ -216,99 +231,160 @@ curl http://localhost:8080/api/v1/cache/stats
 }
 ```
 
-Metric semantics:
+The counters have the following meanings:
 
-- **hits:** `GET` requests that returned a live value.
-- **misses:** `GET` requests with no live value. A missing key is a miss; an
-  expired key is a miss *and* an expiration.
-- **evictions:** live entries removed to make room for a new key at capacity.
-  Replacing an existing key never increments this counter.
-- **expirations:** expired entries detected and removed, whether by `GET`,
-  `DELETE`, replacement, at-capacity cleanup, or a statistics snapshot.
-- **size:** live (unexpired) entries after expired entries are purged.
-- **hitRatio:** `hits / (hits + misses)`, or `0.0` when there have been no reads.
+| Metric | Meaning |
+|---|---|
+| `hits` | GET operations that returned a live value |
+| `misses` | GET operations that found no live value |
+| `evictions` | Live entries removed to make room for new entries |
+| `expirations` | Expired entries detected and removed |
+| `size` | Current number of live entries |
+| `maxEntries` | Configured capacity |
+| `hitRatio` | `hits / (hits + misses)` |
 
-Counters are cumulative since process start. Resetting is not supported.
+Statistics are cumulative for the lifetime of the application process. There is currently no reset operation.
 
-### Errors
+---
 
-Cache and request errors use `application/problem+json` with a stable `code`.
-Framework errors for endpoints outside this contract (for example an unknown
-route) also use problem details, but may omit the `code` property.
+## Configuration
 
-| Status | Code | Cause |
-|---:|---|---|
-| `400` | `INVALID_KEY` | Null/blank/too-long/control-character key |
-| `400` | `INVALID_VALUE` | Missing value or value longer than 1,048,576 characters |
-| `400` | `INVALID_TTL` | TTL is zero, negative, or greater than 365 days |
-| `400` | `INVALID_REQUEST` | Missing or malformed JSON body |
-| `400` | `RESERVED_KEY` | Attempt to use key `stats` through an entry route |
-| `404` | `CACHE_MISS` | No live entry for the key |
-| `413` | `REQUEST_TOO_LARGE` | Declared request body exceeds 2 MiB |
-| `415` | `UNSUPPORTED_MEDIA_TYPE` | Request body is not `application/json` |
+CacheCore exposes its main runtime settings through environment variables.
 
-## Semantics and validation
+| Variable | Default | Description |
+|---|---:|---|
+| `SERVER_PORT` | `8080` | HTTP server port |
+| `CACHECORE_MAX_ENTRIES` | `10000` | Maximum number of live cache entries |
 
-### Keys and values
+For example, on PowerShell:
 
-- Keys are strings used verbatim, with no trimming.
-- Keys must be non-null, non-blank, at most 512 characters, and contain no ISO
-  control characters.
-- Values must be non-null and at most 1,048,576 characters. Empty values are allowed.
-- `stats` is reserved at the HTTP layer so `GET /api/v1/cache/stats` can never be
-  mistaken for a lookup of a key named `stats`.
+```powershell
+$env:SERVER_PORT = "9090"
+$env:CACHECORE_MAX_ENTRIES = "500"
 
-### TTL
-
-- `ttlMillis` is optional, expressed in milliseconds, and must be in `1..31536000000`
-  (one year).
-- Expiration uses `System.nanoTime()`, which is monotonic.
-- An entry is expired at its exact deadline: `now >= expiresAt`.
-- Expiration is lazy. Expired entries are removed when observed; there is no
-  background cleanup thread.
-- Entries without a TTL stay until deleted, evicted, or the process stops.
-
-### Capacity and LRU
-
-- Capacity is enforced by the engine for every insertion.
-- A new key at capacity first reclaims expired entries. If the cache is still
-  full, exactly one least-recently-used live entry is evicted.
-- Successful reads and replacements update recency.
-- Replacing an existing key does not evict another entry.
-- Expired entries are not treated as valid residents during capacity cleanup.
-
-## Docker
-
-Build and run with Compose:
-
-```bash
-docker compose up --build
+java -jar target/cachecore-1.0.0.jar
 ```
 
-Set `CACHECORE_PORT` to change the host port (the container still listens on
-8080), for example `CACHECORE_PORT=9090 docker compose up --build`.
+The maximum entry count must be positive. An invalid value causes application startup to fail.
 
-Or build and run directly:
+---
+
+## Running with Docker
+
+CacheCore includes a multi-stage Dockerfile and a Compose configuration.
+
+Build and start:
 
 ```bash
-docker build -t cachecore:1.0.0 .
-docker run --rm -p 8080:8080 -e CACHECORE_MAX_ENTRIES=10000 cachecore:1.0.0
+docker compose up --build -d
 ```
 
-The image is multi-stage: Maven/JDK 21 builds the jar, and the runtime stage uses
-a slim JRE 21 image and runs as a non-root user. The container exposes port 8080
-and declares a health check against `/actuator/health`.
+Inspect the container:
 
-> Docker tests are skipped inside the image build; run `./mvnw clean verify`
-> separately before building the image.
+```bash
+docker compose ps
+```
 
-## Benchmark
+View application logs:
 
-A dependency-free load generator is provided at `scripts/LoadTest.java`. It uses
-the JDK's `HttpClient`, seeds unique keys, then sends a configurable mix of hits
-and misses. It reports throughput and p50/p95/p99/max latency in milliseconds.
+```bash
+docker compose logs -f
+```
 
-Start the service first, then run:
+Check the health endpoint:
+
+```bash
+curl http://localhost:8080/actuator/health
+```
+
+Stop the service:
+
+```bash
+docker compose down
+```
+
+### Change the cache capacity
+
+PowerShell:
+
+```powershell
+$env:CACHECORE_MAX_ENTRIES = "500"
+
+docker compose up --build -d
+```
+
+Change the host port:
+
+```powershell
+$env:CACHECORE_PORT = "9090"
+
+docker compose up -d
+```
+
+The application continues to listen on port `8080` inside the container; only the host-side port changes.
+
+### Container design
+
+The Dockerfile uses two stages:
+
+1. A Maven and JDK 21 image to compile and package the application.
+2. A Java 21 JRE Alpine image to run the resulting JAR.
+
+The runtime image runs under a dedicated, non-root user and includes a health check against the Actuator endpoint.
+
+The application has no database or external cache dependency. Its entries live in the Java process's memory and disappear when the process stops.
+
+---
+
+## Testing and verification
+
+The automated test suite currently contains **38 tests**.
+
+| Test class | Tests | Coverage |
+|---|---:|---|
+| `CacheEngineTest` | 23 | Cache operations, TTL, LRU, capacity and concurrency |
+| `CacheControllerTest` | 15 | HTTP operations, validation, error handling and health |
+| **Total** | **38** | |
+
+The complete suite was executed using:
+
+```powershell
+.\mvnw.cmd clean verify
+```
+
+**Result: 38 tests, 0 failures, 0 errors, 0 skipped.**
+
+Beyond automated tests, the application was also exercised manually.
+
+Verified behaviours include:
+
+- Creating, retrieving and deleting entries through the REST API.
+- Cache misses and structured error responses.
+- TTL behaviour before and after expiration.
+- LRU eviction under a constrained capacity.
+- Concurrent engine operations and capacity invariants.
+- Docker image construction and container startup.
+- Docker health checks and HTTP requests through the published container port.
+- Runtime capacity configuration through Docker Compose.
+- LRU eviction inside the running Docker container.
+
+The Docker-specific TTL behaviour has not been independently verified yet.
+
+---
+
+## A small performance experiment
+
+A dependency-free load generator is included at:
+
+```text
+scripts/LoadTest.java
+```
+
+It uses Java's built-in `HttpClient` and a fixed thread pool to issue concurrent GET requests against a running CacheCore instance.
+
+The workload includes successful reads and misses against absent keys. It reports request throughput and latency percentiles.
+
+Run it with:
 
 ```bash
 java scripts/LoadTest.java http://localhost:8080 10 32 1000 10
@@ -316,95 +392,101 @@ java scripts/LoadTest.java http://localhost:8080 10 32 1000 10
 
 Arguments:
 
-| Argument | Default | Meaning |
+| Argument | Value | Meaning |
 |---|---:|---|
-| base URL | `http://localhost:8080` | Running CacheCore instance |
-| duration seconds | `10` | Measurement duration |
-| concurrency | `32` | Concurrent client threads |
-| key count | `1000` | Number of pre-seeded hit keys |
-| miss percent | `10` | Percentage of reads sent to absent keys |
+| Base URL | `http://localhost:8080` | CacheCore instance |
+| Duration | `10` | Test duration in seconds |
+| Concurrency | `32` | Client worker threads |
+| Key count | `1000` | Number of seeded hit keys |
+| Miss percentage | `10` | Percentage of reads targeting absent keys |
 
-Output fields:
+### Recorded local measurements
 
+The following runs were performed on Windows 11 using Eclipse Temurin 21.0.13, with the packaged JAR running locally and the default cache capacity of 10,000 entries.
+
+| Metric | Run 1 | Run 2 |
+|---|---:|---:|
+| Requests | 106,667 | 111,048 |
+| Throughput | 10,664.0 req/s | 11,101.3 req/s |
+| Hits | 96,081 | 99,803 |
+| Misses | 10,586 | 11,245 |
+| Errors | 0 | 0 |
+| p50 latency | 1.928 ms | 2.010 ms |
+| p95 latency | 7.887 ms | 7.617 ms |
+| p99 latency | 17.405 ms | 14.072 ms |
+| Maximum latency | 245.765 ms | 129.850 ms |
+
+These are development-machine measurements, not production capacity claims. Results depend on hardware, JVM warm-up, garbage collection, operating-system scheduling and client overhead.
+
+The load generator primarily exercises concurrent reads. It should not be interpreted as a comprehensive write-contention benchmark.
+
+---
+
+## What this implementation does not try to solve
+
+CacheCore is intentionally limited in scope.
+
+- **Single-node only:** There is no clustering, replication or distributed coordination.
+- **Volatile storage:** Entries disappear when the process stops or restarts.
+- **No persistence:** There is no disk-backed storage or recovery mechanism.
+- **No authentication or TLS:** It is not intended to be exposed directly to untrusted networks.
+- **Global synchronization:** A single monitor simplifies correctness but can become a contention bottleneck.
+- **Lazy expiration:** Expired entries may remain in memory until an operation encounters them or cleanup is triggered.
+- **No statistics reset:** Counters are cumulative since process startup.
+
+There are also practical input limits:
+
+- Keys are limited to 512 characters.
+- Values are limited to 1,048,576 characters.
+- TTL must be between 1 millisecond and 365 days.
+- Declared request bodies larger than 2 MiB are rejected.
+
+This project is best understood as a focused implementation and exploration of in-memory caching mechanics, not as a drop-in replacement for Redis or another production cache platform.
+
+---
+
+## Project structure
+
+```text
+CacheCore/
+|
+|-- src/
+|   |-- main/
+|   |   |-- java/com/cachecore/
+|   |   |   |-- CacheCoreApplication.java
+|   |   |   |-- config/
+|   |   |   |-- engine/
+|   |   |   |-- web/
+|   |   |
+|   |   |-- resources/
+|   |       |-- application.yml
+|   |
+|   |-- test/
+|       |-- java/com/cachecore/
+|           |-- engine/
+|           |-- web/
+|
+|-- scripts/
+|   |-- LoadTest.java
+|
+|-- Dockerfile
+|-- compose.yaml
+|-- pom.xml
+|-- mvnw
+|-- mvnw.cmd
+|-- README.md
 ```
-CacheCore load test
-baseUrl=... duration=...s concurrency=... keys=... missPercent=...
-Requests: <total>
-Throughput: <requests per second> req/s
-Hits: <hits>  Misses: <misses>  Errors: <errors>
-Latency ms: p50=<p50> p95=<p95> p99=<p99> max=<max>
-```
 
-Results depend on the machine, JVM warm-up, GC, client overhead, and whether the
-service is running in Docker. Run several times and report the distribution; do
-not treat a single run as a capacity guarantee.
+## Technology
 
-For an independent tool, `hey` also reports a latency distribution:
+- Java 21
+- Spring Boot 3.5.16
+- Maven
+- JUnit 5
+- Docker
+- Docker Compose
 
-```bash
-hey -z 15s -c 32 http://localhost:8080/api/v1/cache/bench-1
-```
+---
+**CacheCore v1.0.0**
 
-(Seed `bench-1` first with `PUT`; otherwise that command measures miss traffic.)
-
-### Measured in this workspace
-
-These measurements were actually obtained on the development machine
-(Windows 11, Temurin 21.0.13) while running the packaged jar locally with the
-default capacity, using
-`java scripts/LoadTest.java http://localhost:8080 10 32 1000 10`:
-
-```
-Run 1: Requests: 106,667  Throughput: 10,664.0 req/s
-       Hits: 96,081  Misses: 10,586  Errors: 0
-       Latency ms: p50=1.928 p95=7.887 p99=17.405 max=245.765
-
-Run 2: Requests: 111,048  Throughput: 11,101.3 req/s
-       Hits: 99,803  Misses: 11,245  Errors: 0
-       Latency ms: p50=2.010 p95=7.617 p99=14.072 max=129.850
-```
-
-These are two local runs, not production benchmarks. Your hardware and JVM
-state will differ.
-
-## Design decisions and limitations
-
-- **Single lock:** straightforward and race-free for this scope; it does not
-  scale across cores as well as sharded or lock-free designs.
-- **`LinkedHashMap` access order:** provides O(1) recency updates and simple LRU
-  selection without a second recency data structure. At-capacity expiration
-  cleanup is O(n).
-- **Lazy expiration:** no scheduler thread and no background CPU cost. Expired
-  entries can sit in memory until they are observed or the cache reaches
-  capacity.
-- **Monotonic clock:** TTLs are unaffected by wall-clock changes. TTL values are
-  not persisted, and deadlines restart after a process restart (all data is lost
-  anyway).
-- **In-memory only:** there is no disk, database, Redis, replication, persistence,
-  clustering, authentication, or TLS termination. Put a reverse proxy in front if
-  those are needed.
-- **Value size limit:** values are limited by character count, not serialized
-  byte size. The declared body-size limit is 2 MiB.
-- **No statistics reset:** counters run for the lifetime of the process.
-- **Reserved key:** `stats` cannot be stored through the REST API. The engine
-  itself does not reserve it, which keeps the engine reusable.
-- **Chunked requests:** the 413 filter relies on `Content-Length`; chunked bodies
-  without that header are still bounded by value validation and the servlet
-  container, but are not rejected at the filter boundary.
-
-## Project layout
-
-```
-src/main/java/com/cachecore/
-  CacheCoreApplication.java
-  config/       CacheProperties, CacheConfiguration
-  engine/       CacheEngine, CacheEntry, CacheStats, CacheValidationException, limits
-  web/          controller, DTOs, error handler, request-size filter
-src/main/resources/application.yml
-src/test/java/com/cachecore/
-  engine/CacheEngineTest.java
-  web/CacheControllerTest.java
-scripts/LoadTest.java
-Dockerfile
-compose.yaml
-```
+Built as an exploration of the engineering behind a simple idea: keeping frequently needed data close, available and fast to retrieve.
